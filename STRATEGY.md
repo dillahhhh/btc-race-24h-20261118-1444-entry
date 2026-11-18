@@ -70,6 +70,13 @@ Versi TS (`main.ts`, commit `ad8a41c`, sebelum perbaikan bar-terakhir):
 - 1 order rejected: sell di bar terakhir window (`after_end`) —
   harness tetap flatten di close; PnL tidak terpengaruh. v3
   menghilangkan order itu (tidak ada order di bar terakhir dev).
+
+Verifikasi v3 (commit `dff4338`, grade ulang resmi): net PnL
+**+91,881548 USDC** (identik), 287 trades, max drawdown 0,26%,
+**0 rejected**, L1 regrade reproduced byte for byte,
+`result_sha256 fdc989577c1cdb48b73ddb6d35b22a84b6e300646cbf5804d134f043aa79f7e7`,
+`action_log_sha256 8472852023f0dd3a62f0d915a41ad4400dd71f9395d282a72627302757fe5868`.
+v3 adalah versi final (STOP iterasi — grid DP 0,05 hanya +$0,36).
 - `authored 0.000000000` pada grade lokal karena grade dijalankan
   tanpa transkrip — transkrip dibundle koordinator (`makefun bundle`),
   bukan oleh worker ini.
