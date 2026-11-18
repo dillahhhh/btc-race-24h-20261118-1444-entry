@@ -78,6 +78,41 @@ Verifikasi v3 (commit `dff4338`, grade ulang resmi): net PnL
 `action_log_sha256 8472852023f0dd3a62f0d915a41ad4400dd71f9395d282a72627302757fe5868`.
 v3 adalah versi final (STOP iterasi — grid DP 0,05 hanya +$0,36).
 
+## v6 dust fix — exit penuh menjual seluruh qty (race bisa trade lagi)
+
+Bug kritis TERBUKTI (temuan checks worker, diverifikasi dari laporan
++ kode): race mode hanya 1 trade per run. Bukti: buy 1.564.591 unit
+→ sell 1.564.590 unit → sisa 1 satoshi → `held` true selamanya →
+cabang entry tidak pernah tercapai lagi; cooldown/time-stop praktis
+dead code. Run kontinu 1440 bar: 1319 bar "held", ~1310 di antaranya
+hanya debu. Akar: di `rebalance()`, qty jual dihitung
+`qty = (delta * 10^13) / (price * 10^6)` — truncasi ganda membuat
+qty 1 unit lebih kecil dari `haveQty` saat menjual penuh.
+
+Perbaikan (satu-satunya perubahan logika): saat `targetTenths == 0`
+(exit penuh), jual `haveQty` SELURUHNYA — bukan qty hasil truncasi.
+Tidak menyentuh SCHEDULE_RLE/DP, gate/threshold (0,6% / 0,45% /
+240 / 30), MAX_SLIPPAGE_BPS, atau logika entry/exit v5 (fill price,
+pending handshake). `rebalance()` dipakai juga mode dev — saat
+target 0 di dev, jual penuh juga benar secara semantik (DP minta 0).
+Fallback cost-basis v5 yang terpicu 1x per run adalah GEJALA bug
+ini — setelah sell, posisi debu memicu fallback. Setelah debu
+diperbaiki, fallback semestinya tidak pernah terpicu.
+
+Verifikasi v6 (grade lokal `--driver process --worktree`):
+net PnL **+91,881554 USDC** (v5: +91,881548; delta +$0,000006,
+dalam toleransi $0,01 — debu bernilai ~$0,0000006), 287 trades,
+max drawdown 0,26%, **0 rejected**, L1 regrade reproduced byte for
+byte, `action_log_sha256`
+`8594a3dcbf47086ed8acad5f40e0384d3393c9216d40200d7a47852341603913`
+(v5: `84728520…`). Uji race sintetis (`/tmp/race-test/test.mjs`,
+ditambah asersi qty penuh): sell `race-sell-1-1`/`-1-2` qty
+1.547.826 = qty penuh yang dipegang (bukan 1.547.825), trade kedua
+`race-buy-2` terjadi setelah sell terkonfirmasi + cooldown 30 bar,
+dan fallback cost-basis TIDAK terpicu di skenario wait (fill
+dilaporkan normal; fallback hanya terpicu di skenario fallback yang
+memang dirancang tanpa fill).
+
 ## v5 fix — race mode: entry dari harga fill, exit hanya saat fill terkonfirmasi
 
 Dua temuan review (substansi BENAR, tapi nomor baris yang dikutip

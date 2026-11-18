@@ -187,7 +187,14 @@ function rebalance(state: BarsState, price: bigint, targetTenths: number, client
     const delta = haveVal - wantVal;
     if (delta >= MIN_ORDER_QUOTE_UNITS && haveQty > 0n) {
       // value = qty * price * 10**quote_scale // 10**(qty_scale+price_scale)
-      let qty = (delta * 10n ** 13n) / (price * 10n ** 6n);
+      // Full exit (target 0) sells the ENTIRE holding, not the
+      // truncated qty: the integer division above rounds down, so a
+      // computed qty is 1 unit short of haveQty and leaves 1-unit
+      // dust that pins `held` true forever (v6 dust fix).
+      const qty =
+        targetTenths === 0
+          ? haveQty
+          : (delta * 10n ** 13n) / (price * 10n ** 6n);
       if (qty > haveQty) qty = haveQty;
       if (qty > 0n) {
         return [{ side: "sell", symbol: SYMBOL, qty, max_slippage_bps: MAX_SLIPPAGE_BPS, ...id }];
