@@ -77,6 +77,61 @@ Verifikasi v3 (commit `dff4338`, grade ulang resmi): net PnL
 `result_sha256 fdc989577c1cdb48b73ddb6d35b22a84b6e300646cbf5804d134f043aa79f7e7`,
 `action_log_sha256 8472852023f0dd3a62f0d915a41ad4400dd71f9395d282a72627302757fe5868`.
 v3 adalah versi final (STOP iterasi — grid DP 0,05 hanya +$0,36).
+
+## v5 fix — race mode: entry dari harga fill, exit hanya saat fill terkonfirmasi
+
+Dua temuan review (substansi BENAR, tapi nomor baris yang dikutip
+857–865 / 917–921 TIDAK COCOK dengan file apa pun di repo:
+`main.ts` 209 baris, `archive/main.py` 209 baris,
+`vendor/makefun-bars.ts` 352 baris — lokasi sebenarnya di `main.ts`:
+entry `raceEntry = close` baris 185, TP/SL baris 151–152, reset
+exit baris 155–157):
+
+- (a) Entry TP/SL diukur dari close bar sinyal, padahal buy baru
+  terisi di open bar berikut. Perbaikan: `raceEntry` TIDAK lagi
+  di-set saat entry; `onBatch` memproses `batch.fills` SEBELUM
+  `raceOrders` dan mengisi `raceEntry` dari `fill.price` buy yang
+  berstatus filled (client_id `race-buy-N`). Selama posisi terbuka
+  tapi entry masih null dan cost basis tidak tersedia, TP/SL TIDAK
+  dievaluasi — bot menunggu laporan fill di batch berikut.
+  Fallback: bila posisi terbuka tanpa fill yang cocok, entry
+  diturunkan dari cost basis posisi (`cost * 10**(qty_scale+
+  price_scale) / (qty * 10**quote_scale)`, inversi `value()` shim;
+  cost sudah termasuk fee jadi sedikit di atas harga fill asli).
+- (b) State exit dulu di-reset saat sell DIKIRIM, sebelum fill
+  terkonfirmasi — sell yang ditolak (mis. `max_slippage` tepat saat
+  harga menembus SL) membuat `raceEntry` null lalu di-re-anchor ke
+  close saat itu, SL bergeser turun. Perbaikan: `raceExitPending`
+  menandai sell yang sedang dalam perjalanan; entry + `raceHeld`
+  dipertahankan, sell kedua tidak dikirim selama pending. Sell
+  filled → baru reset + cooldown 30. Sell rejected → pending
+  dibersihkan, entry asli dipertahankan, exit terpicu lagi dan sell
+  dikirim ulang.
+- `client_id` race harus unik per order: harness menolak pemakaian
+  ulang id apa pun di satu run (`duplicate_client_id` — dan id order
+  yang DITOLAK pun ikut hangus, `sim/bars/engine.ts` `usedIds`).
+  Karena itu buy memakai `race-buy-N` (N = nomor trade) dan setiap
+  percobaan sell memakai `race-sell-N-M` (M = nomor percobaan) —
+  BUKAN `race-buy`/`race-sell` tetap, yang akan ditolak di trade
+  kedua. Dev mode tidak memakai client_id eksplisit (shim tetap
+  memberi `o1, o2, ...`), jadi perilaku dev byte-identik.
+- Gate/threshold (0,6% / 0,45% / 240 / 30), `MAX_SLIPPAGE_BPS`,
+  `SCHEDULE_RLE`/DP, dan mode dev TIDAK disentuh.
+
+Verifikasi v5 (grade lokal `--driver process`, Docker tidak tersedia):
+net PnL **+91,881548 USDC (identik dengan v3)**, 287 trades,
+max drawdown 0,26%, **0 rejected**,
+`action_log_sha256` identik dengan v3
+(`8472852023f0dd3a62f0d915a41ad4400dd71f9395d282a72627302757fe5868`),
+L1 regrade reproduced byte for byte, 2x grade `--worktree`.
+Grade dev TIDAK menyentuh mode race (semua 1440 bar di dev window),
+jadi perbaikan race diuji terpisah dengan harness sintetis
+(`/tmp/race-test/test.mjs`, 314 assertion, 2 skenario): wait-tanpa-fill,
+fallback cost-basis, sell-ditolak lalu kirim-ulang dengan id baru +
+entry dipertahankan, dan trade kedua memakai `race-buy-2`. Fallback
+cost-basis TIDAK pernah terpakai saat grade (mode race tidak jalan
+di dev window; di harness nyata fill selalu dilaporkan di batch yang
+sama dengan posisi, jadi fallback hanya defensif).
 - `authored 0.000000000` pada grade lokal karena grade dijalankan
   tanpa transkrip — transkrip dibundle koordinator (`makefun bundle`),
   bukan oleh worker ini.

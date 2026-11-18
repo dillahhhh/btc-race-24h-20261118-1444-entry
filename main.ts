@@ -32,8 +32,10 @@
  *    latest close (the dip is turning, not still falling), the 60-bar
  *    return no worse than -1.5% (no freefall), and the trailing 60-bar
  *    range under 4% (no chaos). Exits are disciplined: take-profit
- *    +0.45%, stop-loss -0.45% from the entry close, or a 240-bar time
- *    stop, then a 30-bar cooldown before the next buy. Full size on
+ *    +0.45%, stop-loss -0.45% from the actual fill price (never the
+ *    signal bar's close), or a 240-bar time stop, then a 30-bar
+ *    cooldown before the next buy -- the cooldown starts only when the
+ *    exit sell is confirmed filled, not when it is sent. Full size on
  *    entry (one position max, long only, no leverage).
  *
  * Determinism: no clock, no network, no unseeded random. The schedule
@@ -97,25 +99,81 @@ function decodeSchedule(rle: string): number[] {
 // Target position in tenths of equity (0..10) per decision bar.
 const SCHEDULE = decodeSchedule(SCHEDULE_RLE);
 
-// Race-mode state: closes seen so far (raw price, scale 5), entry close
-// of the open race position, bars held, cooldown bars left.
+// Race-mode state: closes seen so far (raw price, scale 5), entry price
+// of the open race position (the buy's actual fill price, never the
+// signal bar's close), bars held, cooldown bars left, and the exit
+// handshake: raceExitPending is true from the batch a sell is sent
+// until the batch its fill (or rejection) is reported. raceTradeNo
+// counts race entries so every race order gets a fresh client_id -- the
+// harness rejects any client_id used by an earlier order of the run
+// (duplicate_client_id), so a fixed 'race-buy'/'race-sell' would be
+// rejected on the second trade -- and a rejected order's id is burnt
+// too, so each sell attempt also gets its own suffix (raceSellNo).
+// raceEntryFromCostBasis records whether
+// the cost-basis fallback ever supplied an entry price.
 const closes: bigint[] = [];
 let raceEntry: bigint | null = null;
 let raceHeld = 0;
 let raceCooldown = 0;
+let raceExitPending = false;
+let raceTradeNo = 0;
+let raceSellNo = 0;
+let raceBuyId = "";
+let raceSellId = "";
+let raceEntryFromCostBasis = false;
+
+/** Entry price implied by the position's cost basis (value() inverted:
+ *  value = qty * price * 10**quote_scale / 10**(qty_scale+price_scale)).
+ *  Cost includes fees, so this is a hair above the true fill price; it
+ *  is only a fallback when no matching buy fill was ever reported. */
+function costBasisEntry(state: BarsState, holding: { qty: bigint; cost: bigint }): bigint | null {
+  const sym = state.symbols.get(SYMBOL);
+  if (sym === undefined || holding.qty <= 0n || holding.cost <= 0n) return null;
+  return (
+    (holding.cost * 10n ** BigInt(sym.qty_scale + sym.price_scale)) /
+    (holding.qty * 10n ** BigInt(state.hello.capital.quote_scale))
+  );
+}
+
+/** Fold this batch's fills into the race state, before any new decision.
+ *  A filled race buy sets the entry to its actual fill price. A filled
+ *  race sell is the only thing that clears the position state (and
+ *  starts the cooldown); a rejected race sell only clears the pending
+ *  flag, keeping the original entry and bars held so the exit resends. */
+function processRaceFills(batch: Batch): void {
+  for (const fill of batch.fills) {
+    if (fill.symbol !== SYMBOL) continue;
+    if (fill.client_id === raceBuyId && fill.side === "buy" && fill.status === "filled") {
+      raceEntry = BigInt(fill.price);
+    } else if (fill.client_id === raceSellId && fill.side === "sell") {
+      if (fill.status === "filled") {
+        raceEntry = null;
+        raceHeld = 0;
+        raceCooldown = 30;
+        raceExitPending = false;
+      } else {
+        raceExitPending = false;
+      }
+    }
+  }
+}
 
 /**
  * One order (at most) moving the position toward targetTenths of equity.
  * Buys spend quote units; sells name a base qty. All integer math;
  * anything under $2 is skipped.
  */
-function rebalance(state: BarsState, price: bigint, targetTenths: number): OrderInput[] {
+function rebalance(state: BarsState, price: bigint, targetTenths: number, clientId?: string): OrderInput[] {
   const equity = state.equity;
   if (equity <= 0n) return [];
   const holding = state.positions.get(SYMBOL);
   const haveQty = holding ? holding.qty : 0n;
   const haveVal = holding ? state.value(SYMBOL, haveQty) : 0n;
   const wantVal = (equity * BigInt(targetTenths)) / 10n;
+  // An explicit client_id is passed through only when given; dev-mode
+  // calls omit it, so the shim keeps assigning its o1, o2, ... ids and
+  // dev behaviour is byte-identical.
+  const id = clientId !== undefined ? { client_id: clientId } : {};
   if (wantVal > haveVal) {
     let amount = wantVal - haveVal;
     const cash = state.cash;
@@ -123,7 +181,7 @@ function rebalance(state: BarsState, price: bigint, targetTenths: number): Order
     const room = state.weightRoom(SYMBOL);
     if (amount > room) amount = room;
     if (amount >= MIN_ORDER_QUOTE_UNITS) {
-      return [{ side: "buy", symbol: SYMBOL, notional_quote_units: amount, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+      return [{ side: "buy", symbol: SYMBOL, notional_quote_units: amount, max_slippage_bps: MAX_SLIPPAGE_BPS, ...id }];
     }
   } else if (wantVal < haveVal) {
     const delta = haveVal - wantVal;
@@ -132,7 +190,7 @@ function rebalance(state: BarsState, price: bigint, targetTenths: number): Order
       let qty = (delta * 10n ** 13n) / (price * 10n ** 6n);
       if (qty > haveQty) qty = haveQty;
       if (qty > 0n) {
-        return [{ side: "sell", symbol: SYMBOL, qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+        return [{ side: "sell", symbol: SYMBOL, qty, max_slippage_bps: MAX_SLIPPAGE_BPS, ...id }];
       }
     }
   }
@@ -145,17 +203,35 @@ function raceOrders(state: BarsState, close: bigint): OrderInput[] {
   const held = holding !== undefined && holding.qty > 0n;
   if (held) {
     raceHeld += 1;
-    if (raceEntry === null) raceEntry = close;
-    // Disciplined exits: TP +0.45%, SL -0.45%, or 240-bar time stop.
+    // A sell is already in flight: wait one batch for its fill report
+    // (processRaceFills above clears the flag); never send a second sell.
+    if (raceExitPending) return [];
+    // No entry price yet: the buy's fill has not been reported. Do NOT
+    // re-anchor to this bar's close -- that was bug (a). Wait, unless
+    // the cost-basis fallback can supply an entry.
+    if (raceEntry === null) {
+      const fromCost = costBasisEntry(state, holding);
+      if (fromCost === null) return [];
+      raceEntry = fromCost;
+      raceEntryFromCostBasis = true;
+      console.error(`race: entry from cost basis ${fromCost}`);
+    }
+    // Disciplined exits: TP +0.45%, SL -0.45% from the fill price, or
+    // 240-bar time stop. Sending the sell changes nothing yet: entry,
+    // bars held and cooldown move only when the fill is confirmed.
+    // Every sell attempt gets a fresh client_id: the harness records an
+    // id as used even when its order is rejected, so resending a
+    // rejected sell under the same id would die as duplicate_client_id.
     if (
       close * 10000n >= raceEntry * 10045n ||
       close * 10000n <= raceEntry * 9955n ||
       raceHeld >= 240
     ) {
-      raceEntry = null;
-      raceHeld = 0;
-      raceCooldown = 30;
-      return rebalance(state, close, 0);
+      raceSellNo += 1;
+      raceSellId = `race-sell-${raceTradeNo}-${raceSellNo}`;
+      const orders = rebalance(state, close, 0, raceSellId);
+      if (orders.length > 0) raceExitPending = true;
+      return orders;
     }
     return [];
   }
@@ -182,9 +258,16 @@ function raceOrders(state: BarsState, close: bigint): OrderInput[] {
     if (c > max60) max60 = c;
   }
   if ((max60 - low60) * 10000n >= low60 * 400n) return [];
-  raceEntry = close;
+  // Entry: do NOT set raceEntry here -- the buy fills at the next bar's
+  // open, and the entry price is that fill's price, reported in the next
+  // batch's fills (processRaceFills). Until then raceEntry stays null
+  // and no TP/SL is evaluated.
+  raceTradeNo += 1;
+  raceBuyId = `race-buy-${raceTradeNo}`;
+  raceSellNo = 0;
+  raceSellId = "";
   raceHeld = 0;
-  return rebalance(state, close, 10);
+  return rebalance(state, close, 10, raceBuyId);
 }
 
 function onBatch(state: BarsState, batch: Batch): OrderInput[] {
@@ -203,6 +286,7 @@ function onBatch(state: BarsState, batch: Batch): OrderInput[] {
     const target = idx >= 0 && idx < SCHEDULE.length ? SCHEDULE[idx] : 0;
     return rebalance(state, close, target);
   }
+  processRaceFills(batch);
   return raceOrders(state, close);
 }
 
