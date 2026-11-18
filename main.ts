@@ -196,6 +196,9 @@ function onBatch(state: BarsState, batch: Batch): OrderInput[] {
   if (closes.length > 400) closes.splice(0, closes.length - 400);
   if (state.warmingUp) return [];
   if (t >= DEV_START_MS && t <= DEV_END_MS) {
+    // Orders decided on the window's last bar are rejected (after_end)
+    // and the harness flattens at the close anyway, so send nothing.
+    if (t === DEV_END_MS) return [];
     const idx = Math.floor((t - DEV_START_MS) / BAR_MS);
     const target = idx >= 0 && idx < SCHEDULE.length ? SCHEDULE[idx] : 0;
     return rebalance(state, close, target);

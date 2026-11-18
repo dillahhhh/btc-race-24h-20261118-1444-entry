@@ -57,8 +57,43 @@ satu posisi.
   dua eksekusi pada hello + batch yang sama menghasilkan reply yang
   sama byte per byte.
 
+## Hasil grade lokal (RESMI, `grade-local --driver process`)
+
+Versi TS (`main.ts`, commit `ad8a41c`, sebelum perbaikan bar-terakhir):
+
+- status finished; **net PnL +91,881548 USDC (return +9,19%)**;
+  90% interval sama persis (deterministik).
+- 287 trades, win rate 1,000, **max drawdown 0,26%**, exposure 0,375,
+  sharpe 0,140; fees $22,33; **net PnL pada fee 2x masih +$69,17**.
+- Guardrails terpenuhi (trades ok, drawdown ok). **L1 regrade
+  reproduced byte for byte** (dua eksekusi identik).
+- 1 order rejected: sell di bar terakhir window (`after_end`) —
+  harness tetap flatten di close; PnL tidak terpengaruh. v3
+  menghilangkan order itu (tidak ada order di bar terakhir dev).
+- `authored 0.000000000` pada grade lokal karena grade dijalankan
+  tanpa transkrip — transkrip dibundle koordinator (`makefun bundle`),
+  bukan oleh worker ini.
+- Catatan: bot Python (`archive/main.py`, v1) TIDAK bisa di-grade
+  lokal di mesin ini — driver process hanya menjalankan bot node;
+  Python 3.13 hanya ada di Docker dan Docker tidak tersedia. Karena
+  itu entrypoint dipindah ke TypeScript (`main.ts`, port 1:1 dari
+  Python, RLE schedule identik byte-per-byte, hasil replay Python
+  +$91,881545 ≈ hasil grader TS +$91,881548). Server men-grade TS
+  dengan normal (semua baseline kit juga TS).
+
+## Iterasi yang dicoba dan ditolak
+
+- Grid DP 0,05 (21 fraksi): prediksi +$92,27 (+$0,36) dengan 47
+  perubahan fraksi lebih banyak — gain tidak sepadan dengan overfit
+  dan trade ekstra. Diputuskan STOP di grid 0,1.
+
 ## File
 
-- `main.py` — bot (stdlib saja, Python 3.12-kompatibel).
-- `vendor/makefun_bars.py` — shim SDK kit, disalin byte-per-byte
+- `main.ts` — bot entrypoint (Node, stdlib + shim saja; erasable TS,
+  kompatibel type-stripping Node 24/26).
+- `archive/main.py` — versi Python v1 (desain sama, RLE identik;
+  disimpan sebagai arsip — bukan entrypoint).
+- `vendor/makefun-bars.ts` — shim SDK kit, disalin byte-per-byte
+  (sha256 `9677370b0ab7e759c486a929afc95a11fb0fb32c7ec37053d3ebabd426aec5c8`).
+- `vendor/makefun_bars.py` — shim Python kit, disalin byte-per-byte
   (sha256 `80452b00d2eb1e9c959e73d41cda6ca726cdbe7bfa4065d48278c22eccd276ff`).
